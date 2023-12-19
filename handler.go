@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"time"
 
@@ -11,49 +10,59 @@ import (
 )
 
 type Handler struct {
-	redisClient *redis.Client
+	ctx     echo.Context
+	cache   *redis.Client
+	metrics *Metrics
 }
 
-func NewHandler(redisClient *redis.Client) *Handler {
+func NewHandler(ctx echo.Context, redisClient *redis.Client, metrics *Metrics) *Handler {
 	return &Handler{
-		redisClient: redisClient,
+		ctx:     ctx,
+		cache:   redisClient,
+		metrics: metrics,
 	}
 }
 
-func (h *Handler) Name(c echo.Context) error {
-	name := c.Param("name")
+func (h *Handler) User() error {
+	name := h.ctx.Param("username")
 
-	if userData, err := h.redisClient.Get(c.Request().Context(), name).Result(); err == nil {
-		c.Logger().Info(fmt.Sprintf("Cache HIT key=%s", name))
+	h.metrics.Add("path", "/:username")
+	h.metrics.Add("method", h.ctx.Request().Method)
+
+	if userData, err := h.cache.Get(h.ctx.Request().Context(), name).Result(); err == nil {
+		h.metrics.Add("redis_cache", "hit")
 
 		var user User
 		err = json.Unmarshal([]byte(userData), &user)
 		if err != nil {
-			c.Logger().Error(err)
+			h.metrics.SendError(err)
 			return echo.ErrInternalServerError
 		}
+		h.metrics.AddAll(user.ToMetrics())
 
-		return c.JSON(http.StatusOK, user)
+		h.metrics.Send()
+		return h.ctx.JSON(http.StatusOK, user)
 	}
-
-	c.Logger().Info(fmt.Sprintf("Cache MISS key=%s", name))
+	h.metrics.Add("redis_cache", "miss")
 
 	user := User{
 		Name:    name,
-		SavedAt: time.Now().Format("15:04:05"),
+		SavedAt: time.Now().Format(time.TimeOnly),
 	}
+	h.metrics.AddAll(user.ToMetrics())
 
 	userData, err := json.Marshal(&user)
 	if err != nil {
-		c.Logger().Error(err)
+		h.metrics.SendError(err)
 		return echo.ErrInternalServerError
 	}
 
-	err = h.redisClient.Set(c.Request().Context(), user.Name, userData, 2*time.Minute).Err()
+	err = h.cache.Set(h.ctx.Request().Context(), user.Name, userData, 2*time.Minute).Err()
 	if err != nil {
-		c.Logger().Error(err)
+		h.metrics.SendError(err)
 		return echo.ErrInternalServerError
 	}
 
-	return c.JSON(http.StatusOK, user)
+	h.metrics.Send()
+	return h.ctx.JSON(http.StatusOK, user)
 }
